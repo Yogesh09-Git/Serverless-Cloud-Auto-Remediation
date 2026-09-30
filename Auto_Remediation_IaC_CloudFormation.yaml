@@ -1,0 +1,221 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: IaC setup for Serverless Cloud Resource Auto-Remediation Platform using AWS
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Select the VPC for the IaC demo EC2 instance.
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Select a subnet in the selected VPC.
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t2.micro]
+
+Resources:
+  AutoRemediationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub AutoRemediation-IaC-Role-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AutoRemediationPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ec2:RebootInstances, ec2:DescribeInstances]
+                Resource: '*'
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:Scan]
+                Resource: !GetAtt IncidentsTable.Arn
+
+  IncidentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub AutoRemediationIncidents-IaC-${AWS::StackName}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: Incident
+          AttributeType: S
+      KeySchema:
+        - AttributeName: Incident
+          KeyType: HASH
+
+  IaCDemoSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for CloudFormation IaC demo EC2
+      VpcId: !Ref VpcId
+
+  IaCDemoInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [!GetAtt IaCDemoSecurityGroup.GroupId]
+      Tags:
+        - Key: Name
+          Value: Auto-Remediation-IaC-Test-Server
+
+  AutoRemediationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub Auto-Remediation-IaC-Lambda-${AWS::StackName}
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt AutoRemediationRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          INCIDENT_TABLE: !Ref IncidentsTable
+          INSTANCE_ID: !Ref IaCDemoInstance
+      Code:
+        ZipFile: |
+          import os, uuid, boto3
+          from datetime import datetime, timezone
+          ec2 = boto3.client('ec2')
+          table = boto3.resource('dynamodb').Table(os.environ['INCIDENT_TABLE'])
+          def lambda_handler(event, context):
+              instance_id = os.environ['INSTANCE_ID']
+              table.put_item(Item={
+                  'Incident': str(uuid.uuid4()),
+                  'resourceId': instance_id,
+                  'resourceType': 'EC2',
+                  'issue': 'High CPU',
+                  'action': 'EC2 Reboot',
+                  'status': 'Remediation Initiated',
+                  'timestamp': datetime.now(timezone.utc).isoformat()
+              })
+              ec2.reboot_instances(InstanceIds=[instance_id])
+              print('Auto-remediation triggered for', instance_id)
+              return {'statusCode': 200, 'message': 'EC2 reboot initiated', 'instance_id': instance_id}
+
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub EC2-High-CPU-IaC-${AWS::StackName}
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref IaCDemoInstance
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 70
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  AlarmEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub EC2-High-CPU-IaC-Rule-${AWS::StackName}
+      State: ENABLED
+      EventPattern:
+        source: [aws.cloudwatch]
+        detail-type: [CloudWatch Alarm State Change]
+        detail:
+          state:
+            value: [ALARM]
+      Targets:
+        - Arn: !GetAtt AutoRemediationLambda.Arn
+          Id: AutoRemediationTarget
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AutoRemediationLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AlarmEventRule.Arn
+
+  DashboardLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub Dashboard-Data-IaC-Lambda-${AWS::StackName}
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt AutoRemediationRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          INCIDENT_TABLE: !Ref IncidentsTable
+      Code:
+        ZipFile: |
+          import os, json, boto3
+          table = boto3.resource('dynamodb').Table(os.environ['INCIDENT_TABLE'])
+          def lambda_handler(event, context):
+              items = table.scan().get('Items', [])
+              return {'statusCode': 200, 'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'}, 'body': json.dumps(items, default=str)}
+
+  DashboardApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub Auto-Remediation-IaC-API-${AWS::StackName}
+
+  IncidentsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref DashboardApi
+      ParentId: !GetAtt DashboardApi.RootResourceId
+      PathPart: incidents
+
+  IncidentsGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DashboardApi
+      ResourceId: !Ref IncidentsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DashboardLambda.Arn}/invocations
+
+  DashboardLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DashboardLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DashboardApi}/*/GET/incidents
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: [IncidentsGetMethod]
+    Properties:
+      RestApiId: !Ref DashboardApi
+      StageName: prod
+
+  DashboardBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      Tags:
+        - Key: Project
+          Value: Auto-Remediation-IaC
+
+Outputs:
+  EC2InstanceId:
+    Value: !Ref IaCDemoInstance
+  DynamoDBTable:
+    Value: !Ref IncidentsTable
+  RemediationLambda:
+    Value: !Ref AutoRemediationLambda
+  CloudWatchAlarm:
+    Value: !Ref HighCPUAlarm
+  EventBridgeRule:
+    Value: !Ref AlarmEventRule
+  APIEndpoint:
+    Value: !Sub https://${DashboardApi}.execute-api.${AWS::Region}.amazonaws.com/prod/incidents
+  DashboardBucket:
+    Value: !Ref DashboardBucket
